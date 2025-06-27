@@ -12,6 +12,12 @@ The goal is to assess how data source impacts model performance when predicting 
 
 ## Repository Structure
 
-- `Validation/` — Full validation pipeline and model evaluation  
-- `DBC_codes/` — Code lists and definitions used to derive predictor history from EHR  
+- [`validation_code.html`](https://jorisholt.github.io/cohort_ehr/validation_code.html)
+  Full model development and validation output for all models (cohort, EHR only, augmented EHR)
+
+- [`baseline_presence.html`](https://jorisholt.github.io/cohort_ehr/baseline_presence.html) 
+  Code-based disease history presence summaries using DBC and ICD definitions
+
+- `Validation/` — R code for model development, validation, calibration, and decision curve analysis  
+- `DBC_codes/` — Code lists and logic used to define disease history from EHR data
 
