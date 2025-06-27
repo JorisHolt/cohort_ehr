@@ -1,0 +1,1144 @@
+---
+title: "Example validation script for cohort and EHR models"
+author: "Joris Holtrop"
+date: "r format(Sys.Date(), '%Y-%B-%d')"
+output:
+html_document:
+toc: true
+toc_float: true
+number_sections: true
+theme: readable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, eval = FALSE)
+```
+
+## Contents
+
+- [1. Introduction](#introduction)
+- [2. Package Loading and Setup](#package-loading-and-setup)
+- [3. Data Preparation](#data-preparation)
+- [4. Pseudo-Observations Methodology](#pseudo-observations-methodology)
+- [5. Model Implementations](#model-implementations)
+- [6. Validation Framework](#validation-framework)
+- [7. Statistical Analysis](#statistical-analysis)
+- [8. Baseline Characteristics](#baseline-characteristics)
+- [9. Results Export](#results-export)
+
+## Introduction {#introduction}
+This document describes the steps and code used for the validation of the following models: 
+
+- **Cohort model**: Model developed on the data from the UCC-SMART cohort
+- **EHR Only**: Model developed on the data as recorded in the EHR data
+- **Augmented EHR model**: Model developed on the data as recorded in the EHR data with medical history augmented from the national registries. 
+
+
+## Package Loading and Setup {#package-loading-and-setup}
+### Package Installation and Loading
+
+```{r package-setup}
+# Function to install and load required packages
+install_and_load_packages <- function(packages) {
+  # Check if packages are installed and install missing packages
+  missing_packages <- packages[!sapply(packages, function(x) requireNamespace(x, quietly = TRUE))]
+  if (length(missing_packages) > 0) {
+    install.packages(missing_packages, dependencies = TRUE)
+  }
+  
+  # Load all packages
+  lapply(packages, library, character.only = TRUE)
+}
+
+# Required packages for survival analysis, competing risks, and validation
+my_packages <- c("ggpubr", "magrittr", "readxl", "tidyverse", "riskRegression", "pec","prodlim", 
+                 "lubridate", "haven", "pamr", "moments", "visdat", "foreign", "mice", "geepack", "dcurves",
+                 "Hmisc", "tableone", "scales", "lattice", "SparseM", "Formula", "boot",
+                 "survival", "survminer", "rms", "cmprsk")
+
+install_and_load_packages(my_packages)
+```
+
+## Data Preparation {#data-preparation}
+## Predictors Used by models
+
+The following predictors are used by the prediction models model. For definitions of the individual CV disease histories see prior sections. We recommend to evaluate extreme predictor values (e.g., CRP\>30 mg/L) as they might reflect acute disease (e.g., infection) and not be reflective of the patients baseline risk factor levels and therefor long term risk. It could be considered to truncate these values.
+
+| Predictor | Units | Name in Script | Accepted Values / Notes |
+|-----------------|-----------------|-----------------|-----------------------|
+| Age | Years | `age` | 40–80 |
+| Sex | — | `sex` | 0 = Female, 1 = Male |
+| Current Smoking Status | — | `isSmoking` | 0 = Non-smoker/former smoker, 1 = Smoker |
+| Systolic Blood Pressure | mmHg | `sbp` | \- |
+| Non-HDL Cholesterol | mmol/L | `nhdl` | \- |
+| Diabetes Diagnosis | — | `diabetesDiagnosis` | 0 = No, 1 = Yes |
+| History of Coronary Artery Disease | — | `coronaryArteryDisease` | 0 = No, 1 = Yes |
+| History of Aortic Aneurysm | — | `aorticAneurysm` | 0 = No, 1 = Yes |
+| History of Cerebrovascular Disease | — | `cerebrovascularDisease` | 0 = No, 1 = Yes |
+| History of Peripheral Artery Disease | — | `peripheralArteryDisease` | 0 = No, 1 = Yes |
+| Years Since First ASCVD Diagnosis | Years | `yearsSinceFirstDiagnosis` | ≥0 |
+| eGFR (CKD-EPI) | mL/min/1.73m² | `gfr` | \- |
+| C-reactive Protein (CRP) | mg/L | `crp` | \- |
+| Antithrombotic Therapy Use | — | `usingAnticoag` | 0 = No, 1 = Yes |
+
+
+## Outcome Definitions
+The outcome for all models is the occurance of recurrent CV events, defined as the composite of non-fatal myocardial infarction, non-fatal stroke and CV-death. This is defined using the following ICD-10 codes.
+
+| Category                 | Endpoint Description                          | ICD-10 Codes   |
+|--------------------------|-----------------------------------------------|----------------|
+| **Fatal CV Disease**     | Hypertensive disease                          | I10–I16        |
+|                          | Ischaemic heart disease                       | I20–I25        |
+|                          | Arrhythmias, heart failure                    | I46–I52        |
+|                          | Cerebrovascular disease                       | I60–I69        |
+|                          | Atherosclerosis / AAA                         | I70–I73        |
+|                          | Sudden death / death < 24h symptom onset      | R96.0–R96.1    |
+| *Excluded (Fatal)*       | Myocarditis, unspecified                      | I51.4          |
+|                          | Subarachnoid haemorrhage                      | I60            |
+|                          | Subdural haemorrhage                          | I62            |
+|                          | Cerebral aneurysm                             | I67.1          |
+|                          | Cerebral arteritis                            | I68.2          |
+|                          | Moyamoya                                      | I67.5          |
+| **Non-Fatal Events**     | Non-fatal myocardial infarction               | I21–I23        |
+|                          | Non-fatal stroke                              | I60–I69        |
+| *Excluded (Non-Fatal)*   | Subarachnoid haemorrhage                      | I60            |
+|                          | Subdural haemorrhage                          | I62            |
+|                          | Cerebral aneurysm                             | I67.1          |
+|                          | Cerebral arteritis                            | I68.2          |
+|                          | Moyamoya                                      | I67.5          |
+
+**Abbreviations:** CV = cardiovascular; AAA = aortic abdominal aneurysm; ICD = International Classification of Diseases
+
+### Data Loading and Initial Processing
+
+```{r data-loading}
+# Load in data here
+# data <- readRDS()
+
+```
+
+### Variable Standardisation and Derived Variables
+
+```{r data-standardisation}
+# Rename variables to match model requirements
+data <- data %>%
+        rename(
+          id = id,                                             #ID variable for patient (necessary for multi state survival models)
+          age = age,                                           #age variable (years)
+          sex = sex,                                           #sex variable (male = 1; female = 0)
+          isSmoking = isSmoking,                               #Current smoking (yes = 1; no = 0)
+          sbp = sbp,                                           #Systolic blood pressure (mmHg)
+          diabetesDiagnosis = diabetesDiagnosis,               #history of diabetes mellitus (yes = 1; no = 0)
+          coronaryArteryDisease = coronaryArteryDisease,       #History of coronary artery disease (yes = 1; no = 0)
+          aorticAneurysm = aorticAneurysm,                     #History of aortic abdominal aneurysms (yes = 1; no = 0)
+          cerebrovascularDisease = cerebrovascularDisease,     #History of cerebrovascular disease (yes = 1; no = 0)
+          peripheralArteryDisease = peripheralArteryDisease,   #History of peripheral artery disease (yes = 1; no = 0)
+          yearsSinceFirstDiagnosis = yearsSinceFirstDiagnosis, #Duration of cardiovascular disease (Years since first diagnsosis, unrounded)
+          crp = crp,                                           #C-reactive protein in mg/L
+          nhdl = nhdl,                                         #non-HDL cholesterol #Please take care of values that are negative when substracting total cholesterol with hdl-cholesterol as measured in mmol/L
+          gfr = gfr,                                           #eGFR as estimated by the CKD-EPI equation
+          usingAnticoag = usingAnticoag,                       #Use of aspirin or equivalent, meaning either vitamine K antagonists, aspirin,
+          hdlCholesterol = hdlCholesterol,                     #HDl cholesterol as measured in mmol/L
+          totalCholesterol = totalCholesterol,                 #Total cholesterol as measured in mmol/L
+          triglycerides = triglycerides,                       #Triglyceride concentration as measured in mmol/L
+          evcom_n = evcom_n,                                   #Outcome variable for cardiovascular diseease (CVD death, non-fatal MI, non-fatal stroke)
+          follow.up = follow.up                               #Follow-up time in years till CVD endpoint/death or end of follow-up
+        ) %>%
+        # Convert to numeric and create derived variables
+        mutate(across(.cols = c(
+          "age", "sex", "isSmoking", "sbp", "diabetesDiagnosis", "coronaryArteryDisease", "aorticAneurysm", 
+          "cerebrovascularDisease", "peripheralArteryDisease", "yearsSinceFirstDiagnosis", "crp", "nhdl", 
+          "gfr", "usingAnticoag", "hdlCholesterol", "totalCholesterol", "triglycerides", "evcom_n", "follow.up"),
+          .fns = ~as.numeric(as.character(.x)))) %>% 
+        mutate(death = ifelse(comp.event == 2, 1, 0)) %>% 
+        # Apply age restrictions (40-80 years as per model specifications)
+        filter(between(age, 40, 80))
+```
+
+## Pseudo-Observations Methodology {#pseudo-observations-methodology}
+### Overall Pseudo-Observations
+
+The pseudo-observation method enables estimation of absolute risks in the presence of competing events. We calculate pseudo-observations for the cumulative incidence function at a fixed time point.
+
+```{r pseudo-observations-overall}
+# Determine maximum follow-up time (75th percentile, capped at 8 years)
+maxtime <- floor(quantile(data %>% pull(follow.up), probs = (0.75)))
+maxtime <- ifelse(maxtime > 8, 8, maxtime) #Truncating the maximum validation horizon to the maximum length of the available baseline hazard
+
+# Calculate pseudo-observations for competing risks
+pseudo_observations <- pseudo::pseudoci(data$follow.up, data$comp.event, tmax = maxtime)
+pseudovalue <- pseudo_observations$pseudo$cause1[,1]
+data$pseudovalue <- pseudovalue
+```
+
+### Subgroup-Specific Pseudo-Observations
+```{r pseudo-observations-subgroups}
+# Define binary variables for subgroup analysis
+subgroup_vars <- c(
+  "sex", "diabetesDiagnosis", "coronaryArteryDisease",
+  "peripheralArteryDisease", "cerebrovascularDisease",
+  "isSmoking", "polyvascular"
+)
+
+# Function to calculate pseudo-observations by subgroup
+calculate_pseudovalue_by_subgroup <- function(data, subgroup_var, tmax = maxtime) {
+  
+        # Initialise storage for subgroup results
+        pseudo_list <- list()
+        
+        for (level in c(0, 1)) {
+          # Filter for subgroup level
+          data_subgroup <- data %>% filter(.data[[subgroup_var]] == level)
+          
+          # Estimate pseudo-observations
+          pseudo_obs <- pseudo::pseudoci(
+            time = data_subgroup$follow.up,
+            event = data_subgroup$comp.event,
+            tmax = tmax
+            )
+          
+          # Extract pseudo-values for cardiovascular events (cause 1)
+          pseudovalue <- pseudo_obs$pseudo$cause1[, 1]
+          
+          # Store with patient IDs
+          pseudo_df <- tibble(
+            id = data_subgroup$id,
+            !!paste0("pseudovalue_", subgroup_var) := pseudovalue
+          )
+          
+          pseudo_list[[as.character(level)]] <- pseudo_df
+          }
+          
+        # Combine and return
+        bind_rows(pseudo_list)
+        }
+
+# Calculate pseudo-observations for each subgroup
+for (var in subgroup_vars) {
+  pseudo_values <- calculate_pseudovalue_by_subgroup(data, var)
+  
+        # Merge with main dataset
+        data <- data %>%
+          left_join(pseudo_values, by = "id")
+}
+```
+
+## Model Implementations {#model-implementations}
+### Data Preprocessing for Models
+```{r data-preprocessing}
+# Competing event indicator
+data$comp.event <- ifelse(data$evcom_n == 1, 1, ifelse(data$death == 1, 2, 0))
+# Calculate overall cumulative incidence
+cuminc_overall <- timepoints(cuminc(ftime = data  %>% pull(follow.up), fstatus = data %>% pull(comp.event)), times = c(seq(0, maxtime, 0.25)))
+
+```
+
+### Variable Transformations
+```{r variable-transformations}
+# Variables requiring transformation
+vars_transform <- c("age", "sbp", "nhdl", "gfr", "crp", "yearsSinceFirstDiagnosis")
+        
+# Transformation types
+transformations <- c("log", "squared", "cubic", "sqrt")
+
+# Apply transformations
+for (var in c(vars_transform)) {
+  for (trans in transformations) {
+    new_col_name <- paste0(var, "_", trans)
+    
+    if (trans == "log") {
+      data[[new_col_name]] <- log(data[[var]]+0.01)
+    } else if (trans == "squared") {
+      data[[new_col_name]] <- data[[var]]^2 
+    } else if (trans == "cubic") {
+      data[[new_col_name]] <- data[[var]]^3
+    } else if (trans == "sqrt") {
+      data[[new_col_name]] <- sqrt(data[[var]])
+    }
+  }
+}
+```
+
+### Estimation of risk for EHR Only model
+
+```{r smart-ehr-model}
+# Baseline survival probabilities by follow-up year
+baseline_risk_onlyEHR <-  c(0.03383572, 0.05523527, 0.07499641, 0.11196860, 0.12903138, 0.14375151, 0.15471154, 0.16036522, 0.16036522)[maxtime]
+
+# Calculate linear predictor and risk estimates
+data <- data %>% 
+        rowwise() %>% 
+        mutate(LPi_onlyEHR = ( 
+          aorticAneurysm * 0.1010391798 +
+          age * -0.0143346294 +
+          age_squared * 0.0003042113 +
+          sex * 0.0518018203 +
+          sbp * 0.0003099021 +  
+          diabetesDiagnosis * 0.3266278504 +
+          coronaryArteryDisease * 0.1457464240 +
+          cerebrovascularDisease * 0.7262360617 + 
+          peripheralArteryDisease * 0.2090070276 +
+          yearsSinceFirstDiagnosis * 0.0787739664 + 
+          yearsSinceFirstDiagnosis_squared * -0.0065482823 + 
+          nhdl_log * 0.141733388 +    
+          gfr * -0.0231984228 +
+          gfr_squared * 0.0001059988 +
+          crp_log * 0.1398548239 + 
+          usingAnticoag * -0.21072103 + 
+          isSmoking * 0.2905959532)) %>% 
+        mutate(sum_exp_onlyEHR = LPi_onlyEHR - (0.09849917)) %>%
+        mutate(calc_risk_onlyEHR = 1 - ((1 - baseline_risk_onlyEHR)^exp(sum_exp_onlyEHR))) %>% 
+        ungroup()
+```
+
+### Estimation of risk for augmented EHR model
+
+```{r smart-ehr-lmr-model}
+# Baseline survival probabilities for SMART-EHR+LMR
+baseline_risk_augmentedEHR <- c(0.03363064, 0.0544217, 0.07370124, 0.09226646, 0.10975002, 0.12651250, 0.14095680, 0.15172874, 0.15729814, 0.15729814)[maxtime]
+
+# Calculate linear predictor with lifestyle and medication variables
+data <- data %>% 
+        rowwise() %>% 
+        mutate(LPi_augmentedEHR = ( 
+          aorticAneurysm * 0.1346276093 +
+          age * 0.0204512801 +
+          sex * 0.0323470315 +
+          sbp * -0.0231418513 +  
+          sbp_squared * 0.0000792204 + 
+          diabetesDiagnosis * 0.2926953422 +
+          coronaryArteryDisease * 0.1863717004 +
+          cerebrovascularDisease * 0.8088198070 + 
+          peripheralArteryDisease * 0.2031033279 +
+          yearsSinceFirstDiagnosis_log * 0.0810834047 + 
+          nhdl_log * 0.2074096039 +    
+          gfr * -0.0243375448 +
+          gfr_squared * 0.0001240516 +
+          crp_log * 0.1394668124 + 
+          usingAnticoag * -0.21072103 + 
+          isSmoking * 0.2342662502)) %>% 
+        mutate(sum_exp_augmentedEHR = LPi_augmentedEHR - (-0.5572993)) %>% 
+        mutate(calc_risk_augmentedEHR = 1 - ((1 - baseline_risk_augmentedEHR)^exp(sum_exp_augmentedEHR))) %>%
+        ungroup()
+```
+
+### Estimation of risk for the cohort model
+
+```{r ucc-smart-model}
+# Baseline survival probabilities for cohort model
+baseline_risk_cohort <- c(0.01176831, 0.02269663, 0.03072704, 0.04150695, 0.05435768, 0.06801865, 0.08318299, 0.09992709, 0.11479224, 0.13262999)[maxtime]
+
+# Calculate linear predictor for cohort model
+data <- data %>% 
+        rowwise() %>% 
+        mutate(LPi_cohort = ( 
+          aorticAneurysm* 0.2424620061 +
+          age * -0.0481899559 +
+          age_squared * 0.0006468527 +
+          sex * 0.1619802088 +
+          sbp * 0.0035577720 +  
+          diabetesDiagnosis * 0.3711196479 +
+          coronaryArteryDisease * 0.21191546837 +
+          cerebrovascularDisease * 0.2908575182 + 
+          peripheralArteryDisease * 0.1909020275 +
+          yearsSinceFirstDiagnosis * 0.0691104518 + 
+          yearsSinceFirstDiagnosis_squared * -0.0022356284 + 
+          nhdl_log * 0.3465325672 +    
+          gfr * -0.0375043268 +
+          gfr_squared * 0.0002206348 +
+          crp_log * 0.1541556405 + 
+          usingAnticoag * -0.21072103 + 
+          isSmoking * 0.2868110233)) %>% 
+        mutate(sum_exp_cohort = LPi_cohort - (-0.4111911)) %>% 
+        mutate(calc_risk_cohort = 1 - ((1 - baseline_risk_cohort)^exp(sum_exp_cohort))) %>%
+        ungroup()
+```
+
+## Validation Framework {#validation-framework}
+
+### Comparing C-statistics for various models
+
+```{r model-contrasts}
+# Function for C-statistic contrasts between models
+score_contrast <- function(data, maxtime, risk1, risk2, subgroup_var = NULL, level = NULL) {
+
+          # Filter by subgroup if specified
+          if (!is.null(subgroup_var) && !is.null(level)) {
+            data <- data %>% filter(.data[[subgroup_var]] == level)
+            subgroup <- subgroup_var
+          } else {
+            subgroup <- "overall"
+            level <- NA
+          }
+          
+          # Truncate follow-up and event status at maxtime
+          data <- data %>% 
+            mutate(
+              comp.event_trunc = ifelse(follow.up > maxtime + 0.0001, 0, comp.event), 
+              trunc_fu = pmin(follow.up, maxtime + 0.0001)
+            )
+          
+          # Calculate C-statistic contrast
+          score_out <- Score(
+            list("risk1" = data[[risk1]],
+                 "risk2" = data[[risk2]]),
+            formula = Hist(trunc_fu, comp.event_trunc) ~ 1,
+            data = data,
+            times = maxtime,
+            metrics = "auc",
+            cause = 1,
+            contrasts = TRUE
+          )
+          
+          # Extract contrast results
+          contrast_auc <- score_out$AUC$contrasts
+          
+          # Summary statistics
+          n <- nrow(data)
+          CV_events <- sum(data$comp.event == 1 & data$follow.up <= maxtime)
+          personyears <- sum(pmin(data$follow.up, maxtime), na.rm = TRUE)
+          
+          tibble(
+            subgroup = subgroup,
+            level = level,
+            model = contrast_auc$model,
+            reference = contrast_auc$reference,
+            diff = contrast_auc$delta.AUC,
+            lower = contrast_auc$lower,
+            upper = contrast_auc$upper,
+            pval = contrast_auc$p,
+            n = n,
+            CV_events = CV_events,
+            personyears = personyears
+          )
+}
+
+# Overall model comparisons
+contrast_onlyEHR_vs_cohort <- score_contrast(data,  risk1 = "calc_risk_onlyEHR", risk2 = "calc_risk_cohort", maxtime)
+contrast_augmentedEHR_vs_cohort <- score_contrast(data,  risk1 = "calc_risk_augmentedEHR", risk2 = "calc_risk_cohort", maxtime)
+contrast_onlyEHR_vs_augmentedEHR <- score_contrast(data,  risk1 = "calc_risk_augmentedEHR", risk2 = "calc_risk_onlyEHR", maxtime)
+```
+
+## Statistical Analysis {#statistical-analysis}
+
+### Validation Loop Structure
+The main validation analysis is performed using a structured loop that applies consistent methodology across all three models.
+
+```{r validation-loop-structure}
+# Initialise results storage
+results_list <- list()
+risk_names <- c("calc_risk_smartehr", "calc_risk_smartehr_lmr", "calc_risk_uccsmart")
+span <- 0.75  # Smoothing parameter for calibration plots
+
+# Main validation loop
+for (risk_column in risk_names) {
+  
+      suffix <- str_replace(risk_column, "calc_risk_", "")
+      
+      # Dynamically use the corresponding sum_exp and baseline_risk
+      sum_exp_col <- paste0("sum_exp_", suffix)
+      baseline_risk_var <- paste0("baseline_risk_", suffix)
+      baseline_risk <- get(baseline_risk_var)
+      
+      # Inject the current risk column as calc_risk
+      data <- data %>%
+              mutate(
+                calc_risk = .data[[risk_column]],
+                sum_exp = .data[[sum_exp_col]]
+              )
+  
+      ########## Expected-to-Observed Ratio Analysis ##########
+      # EO-RATIO: OVERALL + SUBGROUPS
+      eo_list <- list()
+      
+      # Overall population
+      ci_results <- timepoints(cuminc(ftime = data$follow.up, fstatus = data$comp.event), times = maxtime)
+      observed <- ci_results$est[1]
+      observed_var <- ci_results$var[1]
+      observed_se <- sqrt(observed_var)
+      
+      predicted_mean <- mean(data$calc_risk)
+      predicted_sd <- sd(data$calc_risk)
+      EO <- predicted_mean / observed
+      
+      eo_list[["overall"]] <- tibble(
+        subgroup = "overall",
+        level = NA,
+        EO = EO,
+        lower = EO / exp(qnorm(0.975) * observed_se / observed),
+        upper = EO / exp(-qnorm(0.975) * observed_se / observed),
+        n = nrow(data),
+        CV_events = sum(data$comp.event == 1 & data$follow.up <= maxtime),
+        personyears = sum(pmin(data$follow.up, maxtime), na.rm = TRUE)
+      )
+      
+      # Subgroup E:O ratios
+      for (var in subgroup_vars) {
+        present_levels <- sort(unique(data[[var]]))
+        present_levels <- present_levels[!is.na(present_levels)]
+        
+        for (level in present_levels) {
+          df <- data %>% filter(.data[[var]] == level)
+          if (nrow(df) == 0) next
+          
+          ci_results <- timepoints(cuminc(ftime = df$follow.up, fstatus = df$comp.event), times = maxtime)
+          obs <- ci_results$est[1]
+          var_obs <- ci_results$var[1]
+          se_obs <- sqrt(var_obs)
+          
+          pred <- mean(df$calc_risk)
+          eo <- pred / obs
+          
+          eo_list[[paste0(var, "_", level)]] <- tibble(
+            subgroup = var,
+            level = level,
+            EO = eo,
+            lower = eo / exp(qnorm(0.975) * se_obs / obs),
+            upper = eo / exp(-qnorm(0.975) * se_obs / obs),
+            n = nrow(df),
+            CV_events = sum(df$comp.event == 1 & df$follow.up <= maxtime),
+            personyears = sum(pmin(df$follow.up, maxtime), na.rm = TRUE)
+          )
+        }
+      }
+      
+      ########## Pre-Recalibration Calibration Analysis ##########
+      calibration_unrecalibrated <- calibratie_smooth(year.risk_d = maxtime, 
+        data = data, predicted_risk = "calc_risk", 
+        competing_outcome = "comp.event", 
+        comptimeyear = "follow.up", 
+        spanCI = span, 
+        spanSM = span, 
+        plot_title = "")
+      
+      # Subgroup calibration plots (pre-recalibration)
+      subgroup_cal_plots_pre <- list()
+      
+      for (var in subgroup_vars) {
+        for (level in c(0, 1)) {
+          subgroup_df <- data %>% filter(.data[[var]] == level)
+          
+          subgroup_cal_plots_pre[[paste0(var, "_", level)]] <- calibratie_smooth(
+            year.risk_d = maxtime,
+            data = subgroup_df,
+            predicted_risk = "calc_risk",
+            competing_outcome = "comp.event",
+            comptimeyear = "follow.up",
+            spanCI = span,
+            spanSM = span,
+            plot_title = paste("Pre-recalibration:", var, "=", level)
+          )
+        }
+      }
+      
+      subgroup_cal_plots_pre[["overall"]] <- calibration_unrecalibrated
+      
+      ########## Calibration Slopes and Intercepts (Pre-Recalibration) ##########
+      data <- data %>%
+          mutate(cll_pred = log(-log(1 - calc_risk)))
+      
+      # Overall population calibration
+      fit_cal_int_all <- geepack::geese(
+        pseudovalue ~ offset(cll_pred),
+        data = data,
+        id = id,
+        scale.fix = TRUE,
+        family = gaussian,
+        mean.link = "cloglog",
+        corstr = "independence",
+        jack = TRUE
+      )
+      
+      fit_cal_slope_all <- geepack::geese(
+        pseudovalue ~ offset(cll_pred) + cll_pred,
+        data = data,
+        id = id,
+        scale.fix = TRUE,
+        family = gaussian,
+        mean.link = "cloglog",
+        corstr = "independence",
+        jack = TRUE
+      )
+      
+      # Extract overall calibration results
+      intercept_raw_all <- summary(fit_cal_int_all)$mean
+      intercept_all <- with(intercept_raw_all,
+                            c(
+                              estimate = estimate,
+                              se = san.se,
+                              lower = estimate - qnorm(0.975) * san.se,
+                              upper = estimate + qnorm(0.975) * san.se
+                            ))
+      
+      slope_raw_all <- summary(fit_cal_slope_all)$mean["cll_pred", ]
+      slope_all <- with(slope_raw_all,
+                        c(
+                          estimate = 1 + estimate,
+                          se = san.se,
+                          lower = 1 + (estimate - qnorm(0.975) * san.se),
+                          upper = 1 + (estimate + qnorm(0.975) * san.se)
+                        ))
+      
+      # Wald test for overall
+      betas_all <- fit_cal_slope_all$beta
+      vcov_all <- fit_cal_slope_all$vbeta
+      wald_all <- drop(betas_all %*% solve(vcov_all) %*% betas_all)
+      pval_all <- pchisq(wald_all, df = 2, lower.tail = FALSE)
+      
+      # Store overall calibration results
+      calibration_results_overall_norec <- tibble(
+        subgroup = "overall",
+        level = NA,
+        intercept_est = intercept_all["estimate"],
+        intercept_se  = intercept_all["se"],
+        intercept_lo  = intercept_all["lower"],
+        intercept_hi  = intercept_all["upper"],
+        slope_est     = slope_all["estimate"],
+        slope_se      = slope_all["se"],
+        slope_lo      = slope_all["lower"],
+        slope_hi      = slope_all["upper"],
+        wald_stat     = wald_all,
+        pval          = pval_all
+      )
+      
+      # Subgroup calibration slopes and intercepts
+      calibration_results <- list()
+      
+      for (var in subgroup_vars) {
+        present_levels <- sort(unique(data[[var]]))
+        present_levels <- present_levels[!is.na(present_levels)]
+        
+        for (level in present_levels) {
+          
+          # Filter to subgroup
+          subgroup_data <- data %>%
+            filter(.data[[var]] == level)
+          
+          # Construct correct pseudovalue column name
+          pseudo_col <- paste0("pseudovalue_", var)
+          
+          # Drop rows with missing pseudo-observations
+          subgroup_data <- subgroup_data %>%
+            filter(!is.na(.data[[pseudo_col]])) %>%
+            mutate(pseudovalue = .data[[pseudo_col]]) # overwrite for modelling
+          
+          # Calibration intercept model
+          fit_cal_int <- geepack::geese(
+            pseudovalue ~ offset(cll_pred),
+            data = subgroup_data,
+            id = id,
+            scale.fix = TRUE,
+            family = gaussian,
+            mean.link = "cloglog",
+            corstr = "independence",
+            jack = TRUE
+          )
+          
+          # Calibration slope model
+          fit_cal_slope <- geepack::geese(
+            pseudovalue ~ offset(cll_pred) + cll_pred,
+            data = subgroup_data,
+            id = id,
+            scale.fix = TRUE,
+            family = gaussian,
+            mean.link = "cloglog",
+            corstr = "independence",
+            jack = TRUE
+          )
+          
+          # Extract intercept results
+          intercept_raw <- summary(fit_cal_int)$mean
+          intercept <- with(intercept_raw,
+                            c(
+                              estimate = estimate,
+                              se = san.se,
+                              lower = estimate - qnorm(0.975) * san.se,
+                              upper = estimate + qnorm(0.975) * san.se
+                            ))
+          
+          # Extract slope results (adjusting for offset)
+          slope_raw <- summary(fit_cal_slope)$mean["cll_pred", ]
+          slope <- with(slope_raw,
+                        c(
+                          estimate = 1 + estimate,
+                          se = san.se,
+                          lower = 1 + (estimate - qnorm(0.975) * san.se),
+                          upper = 1 + (estimate + qnorm(0.975) * san.se)
+                        ))
+          
+          # Wald test for joint null: intercept=0 and slope=1
+          betas <- fit_cal_slope$beta
+          vcov_mat <- fit_cal_slope$vbeta
+          wald_stat <- drop(betas %*% solve(vcov_mat) %*% betas)
+          pval <- pchisq(wald_stat, df = 2, lower.tail = FALSE)
+          
+          # Store subgroup results
+          calibration_results[[paste0(var, "_", level)]] <- tibble(
+            subgroup = var,
+            level = level,
+            intercept_est = intercept["estimate"],
+            intercept_se  = intercept["se"],
+            intercept_lo  = intercept["lower"],
+            intercept_hi  = intercept["upper"],
+            slope_est     = slope["estimate"],
+            slope_se      = slope["se"],
+            slope_lo      = slope["lower"],
+            slope_hi      = slope["upper"],
+            wald_stat     = wald_stat,
+            pval          = pval
+          )
+        }
+      }
+      
+      calibration_summary_norec <- bind_rows(calibration_results)
+      calibration_summary_norec <- rbind(calibration_summary_norec, calibration_results_overall_norec)
+      
+      ############## Model Recalibration ############## 
+      data <- data %>%
+          mutate(calc_risk = 1 - ((1 - baseline_risk)^exp(sum_exp - log(EO))))
+      
+      ######### Post-Recalibration Calibration Analysis ######### 
+      calibration_recalibrated <- calibratie_smooth(year.risk_d = maxtime, 
+        data = data, predicted_risk = "calc_risk", 
+        competing_outcome = "comp.event", 
+        comptimeyear = "follow.up", 
+        spanCI = span, 
+        spanSM = span, 
+        plot_title = "")
+      
+      # Subgroup calibration plots (post-recalibration)
+      subgroup_cal_plots_post <- list()
+      
+      for (var in subgroup_vars) {
+        present_levels <- sort(unique(data[[var]]))
+        present_levels <- present_levels[!is.na(present_levels)]
+        
+        for (level in present_levels) {
+          subgroup_df <- data %>% filter(.data[[var]] == level)
+          
+          subgroup_cal_plots_post[[paste0(var, "_", level)]] <- calibratie_smooth(
+            year.risk_d = maxtime,
+            data = subgroup_df,
+            predicted_risk = "calc_risk",
+            competing_outcome = "comp.event",
+            comptimeyear = "follow.up",
+            spanCI = span,
+            spanSM = span,
+            plot_title = paste("Post-recalibration:", var, "=", level)
+          )
+        }
+      }
+      
+      subgroup_cal_plots_post[["overall"]] <- calibration_recalibrated
+      
+      ######### Post-Recalibration Slopes and Intercepts ######### 
+      data <- data %>%
+          mutate(cll_pred = log(-log(1 - calc_risk)))
+      
+      # Overall population (post-recalibration)
+      fit_cal_int_all <- geepack::geese(
+        pseudovalue ~ offset(cll_pred),
+        data = data,
+        id = id,
+        scale.fix = TRUE,
+        family = gaussian,
+        mean.link = "cloglog",
+        corstr = "independence",
+        jack = TRUE
+      )
+      
+      fit_cal_slope_all <- geepack::geese(
+        pseudovalue ~ offset(cll_pred) + cll_pred,
+        data = data,
+        id = id,
+        scale.fix = TRUE,
+        family = gaussian,
+        mean.link = "cloglog",
+        corstr = "independence",
+        jack = TRUE
+      )
+      
+      # Extract post-recalibration overall results
+      intercept_raw_all <- summary(fit_cal_int_all)$mean
+      intercept_all <- with(intercept_raw_all,
+                            c(
+                              estimate = estimate,
+                              se = san.se,
+                              lower = estimate - qnorm(0.975) * san.se,
+                              upper = estimate + qnorm(0.975) * san.se
+                            ))
+      
+      slope_raw_all <- summary(fit_cal_slope_all)$mean["cll_pred", ]
+      slope_all <- with(slope_raw_all,
+                        c(
+                          estimate = 1 + estimate,
+                          se = san.se,
+                          lower = 1 + (estimate - qnorm(0.975) * san.se),
+                          upper = 1 + (estimate + qnorm(0.975) * san.se)
+                        ))
+      
+      # Wald test (post-recalibration)
+      betas_all <- fit_cal_slope_all$beta
+      vcov_all <- fit_cal_slope_all$vbeta
+      wald_all <- drop(betas_all %*% solve(vcov_all) %*% betas_all)
+      pval_all <- pchisq(wald_all, df = 2, lower.tail = FALSE)
+      
+      # Store post-recalibration overall results
+      calibration_results_overall_rec <- tibble(
+        subgroup = "overall",
+        level = NA,
+        intercept_est = intercept_all["estimate"],
+        intercept_se  = intercept_all["se"],
+        intercept_lo  = intercept_all["lower"],
+        intercept_hi  = intercept_all["upper"],
+        slope_est     = slope_all["estimate"],
+        slope_se      = slope_all["se"],
+        slope_lo      = slope_all["lower"],
+        slope_hi      = slope_all["upper"],
+        wald_stat     = wald_all,
+        pval          = pval_all
+      )
+      
+      # Subgroup post-recalibration analysis
+      calibration_results <- list()
+      
+      for (var in subgroup_vars) {
+        present_levels <- sort(unique(data[[var]]))
+        present_levels <- present_levels[!is.na(present_levels)]
+        
+        for (level in present_levels) {
+          
+          # Filter to subgroup
+          subgroup_data <- data %>%
+            filter(.data[[var]] == level)
+          
+          # Construct correct pseudovalue column name
+          pseudo_col <- paste0("pseudovalue_", var)
+          
+          # Drop rows with missing pseudo-observations
+          subgroup_data <- subgroup_data %>%
+            filter(!is.na(.data[[pseudo_col]])) %>%
+            mutate(pseudovalue = .data[[pseudo_col]]) # overwrite for modelling
+          
+          # Calibration intercept
+          fit_cal_int <- geepack::geese(
+            pseudovalue ~ offset(cll_pred),
+            data = subgroup_data,
+            id = id,
+            scale.fix = TRUE,
+            family = gaussian,
+            mean.link = "cloglog",
+            corstr = "independence",
+            jack = TRUE
+          )
+          
+          # Calibration slope
+          fit_cal_slope <- geepack::geese(
+            pseudovalue ~ offset(cll_pred) + cll_pred,
+            data = subgroup_data,
+            id = id,
+            scale.fix = TRUE,
+            family = gaussian,
+            mean.link = "cloglog",
+            corstr = "independence",
+            jack = TRUE
+          )
+          
+          # Extract intercept results
+          intercept_raw <- summary(fit_cal_int)$mean
+          intercept <- with(intercept_raw,
+                            c(
+                              estimate = estimate,
+                              se = san.se,
+                              lower = estimate - qnorm(0.975) * san.se,
+                              upper = estimate + qnorm(0.975) * san.se
+                            ))
+          
+          # Extract slope results (adjusting for offset)
+          slope_raw <- summary(fit_cal_slope)$mean["cll_pred", ]
+          slope <- with(slope_raw,
+                        c(
+                          estimate = 1 + estimate,
+                          se = san.se,
+                          lower = 1 + (estimate - qnorm(0.975) * san.se),
+                          upper = 1 + (estimate + qnorm(0.975) * san.se)
+                        ))
+          
+          # Wald test for joint null: intercept=0 and slope=1
+          betas <- fit_cal_slope$beta
+          vcov_mat <- fit_cal_slope$vbeta
+          wald_stat <- drop(betas %*% solve(vcov_mat) %*% betas)
+          pval <- pchisq(wald_stat, df = 2, lower.tail = FALSE)
+          
+          # Store results
+          calibration_results[[paste0(var, "_", level)]] <- tibble(
+            subgroup = var,
+            level = level,
+            intercept_est = intercept["estimate"],
+            intercept_se  = intercept["se"],
+            intercept_lo  = intercept["lower"],
+            intercept_hi  = intercept["upper"],
+            slope_est     = slope["estimate"],
+            slope_se      = slope["se"],
+            slope_lo      = slope["lower"],
+            slope_hi      = slope["upper"],
+            wald_stat     = wald_stat,
+            pval          = pval
+          )
+        }
+      }
+      
+      calibration_summary_rec <- bind_rows(calibration_results)
+      calibration_summary_rec <- rbind(calibration_summary_rec, calibration_results_overall_rec)
+      
+      ######### C-statistic Analysis ######### 
+      # Overall C-statistic calculation
+      calculate_cstat_overall <- function(data, risk_col = "calc_risk", tmax = maxtime) {
+        
+        # Truncate follow-up and event status at tmax
+        data <- data %>%
+          mutate(
+            comp.event_trunc = ifelse(follow.up > tmax + 0.0001, 0, comp.event),
+            trunc_fu = pmin(follow.up, tmax + 0.0001)
+          )
+        
+        # Summary statistics
+        stats <- list(
+          n = nrow(data),
+          CV_events = sum(data$comp.event == 1 & data$follow.up <= tmax),
+          personyears = sum(pmin(data$follow.up, tmax), na.rm = TRUE)
+        )
+        
+        # Harrell's C-index (rcorr.cens)
+        fu_cstat <- ifelse(data$comp.event == 2, max(data$follow.up) + 1, data$trunc_fu)
+        surv_obj <- Surv(fu_cstat, data$comp.event_trunc == 1)
+        
+        rcorr_out <- rcorr.cens(x = 1 - data[[risk_col]], S = surv_obj)
+        cstat <- rcorr_out[["C Index"]]
+        se <- rcorr_out[["S.D."]] / 2
+        lower <- cstat - 1.96 * se
+        upper <- cstat + 1.96 * se
+        
+        cstat_rcorr <- tibble(
+          method = "rcorr.cens",
+          Cstatistics = cstat,
+          se = se,
+          CstatisticsLL = lower,
+          CstatisticsUL = upper,
+          observations = stats$n,
+          CV_events = stats$CV_events,
+          personyears = round(stats$personyears, 1),
+          cstat_fmt = sprintf("%.3f [%.3f–%.3f]", cstat, lower, upper)
+        )
+        
+        # Time-dependent AUC (Score)
+        score_out <- riskRegression::Score(
+          list("model" = data[[risk_col]]),
+          formula = Hist(trunc_fu, comp.event_trunc) ~ 1,
+          data = data,
+          times = tmax,
+          metrics = "auc",
+          cause = 1
+        )
+        
+        score_val <- score_out$AUC$score %>%
+          filter(model == "model") %>%
+          select(AUC, lower, upper) %>%
+          slice(1)
+        
+        cstat_score <- tibble(
+          method = "Score",
+          Cstatistics = score_val$AUC,
+          lower = score_val$lower,
+          upper = score_val$upper,
+          observations = stats$n,
+          CV_events = stats$CV_events,
+          personyears = round(stats$personyears, 1),
+          cstat_fmt = sprintf("%.3f [%.3f–%.3f]", score_val$AUC, score_val$lower, score_val$upper)
+        )
+        
+        return(list(
+          cstat_rcorr = cstat_rcorr,
+          cstat_score = cstat_score
+        ))
+      }
+      
+      cstatistic_overall <- calculate_cstat_overall(data = data)
+      
+      # Subgroup C-statistic calculation
+      calculate_cstat_subgroup <- function(data, risk_col = "calc_risk", tmax = maxtime) {
+        cstat_rcorr_list <- list()
+        cstat_score_list <- list()
+        
+        # Helper function for summary statistics
+        get_summary_stats <- function(df) {
+          list(
+            n = nrow(df),
+            CV_events = sum(df$comp.event == 1 & df$follow.up <= tmax, na.rm = TRUE),
+            personyears = sum(pmin(df$follow.up, tmax), na.rm = TRUE)
+          )
+        }
+        
+        # Apply truncation to full dataset
+        data <- data %>%
+          mutate(
+            comp.event_trunc = ifelse(follow.up > tmax + 0.0001, 0, comp.event),
+            trunc_fu = pmin(follow.up, tmax + 0.0001)
+          )
+        
+        # Loop over subgroups
+        for (var in subgroup_vars) {
+          present_levels <- sort(unique(data[[var]]))
+          present_levels <- present_levels[!is.na(present_levels)]
+          
+          for (level in present_levels) {
+            
+            df <- data %>% filter(.data[[var]] == level)
+            if (nrow(df) < 10) next  # Skip very small subgroups
+            
+            stats <- get_summary_stats(df)
+            
+            # Harrell's C-index
+            fu_cstat <- ifelse(df$comp.event_trunc == 2, max(df$follow.up) + 1, df$trunc_fu)
+            surv_obj <- Surv(fu_cstat, df$comp.event_trunc == 1)
+            
+            rcorr_out <- rcorr.cens(x = 1 - df[[risk_col]], S = surv_obj)
+            cstat <- rcorr_out[["C Index"]]
+            se <- rcorr_out[["S.D."]] / 2
+            lower <- cstat - 1.96 * se
+            upper <- cstat + 1.96 * se
+            
+            cstat_rcorr_list[[paste0(var, "_", level)]] <- tibble(
+              subgroup = var,
+              level = level,
+              Cstatistics = cstat,
+              se = se,
+              CstatisticsLL = lower,
+              CstatisticsUL = upper,
+              observations = stats$n,
+              CV_events = stats$CV_events,
+              personyears = round(stats$personyears, 1),
+              cstat_fmt = sprintf("%.3f [%.3f–%.3f]", cstat, lower, upper)
+            )
+            
+            # Time-dependent AUC
+            score_out <- riskRegression::Score(
+              list("model" = df[[risk_col]]),
+              formula = Hist(trunc_fu, comp.event_trunc) ~ 1,
+              data = df,
+              times = tmax,
+              metrics = "auc",
+              cause = 1
+            )
+            
+            score_val <- score_out$AUC$score %>%
+              filter(model == "model") %>%
+              select(AUC, lower, upper) %>%
+              slice(1)
+            
+            cstat_score_list[[paste0(var, "_", level)]] <- tibble(
+              subgroup = var,
+              level = level,
+              Cstatistics = score_val$AUC,
+              lower = score_val$lower,
+              upper = score_val$upper,
+              observations = stats$n,
+              CV_events = stats$CV_events,
+              personyears = round(stats$personyears, 1),
+              cstat_fmt = sprintf("%.3f [%.3f–%.3f]", score_val$AUC, score_val$lower, score_val$upper)
+            )
+          }
+        }
+        
+        # Add overall population results
+        df <- data
+        stats <- get_summary_stats(df)
+        
+        fu_cstat <- ifelse(df$comp.event_trunc == 2, max(df$follow.up) + 1, df$trunc_fu)
+        surv_obj <- Surv(fu_cstat, df$comp.event_trunc == 1)
+        
+        rcorr_out <- rcorr.cens(x = 1 - df[[risk_col]], S = surv_obj)
+        cstat <- rcorr_out[["C Index"]]
+        se <- rcorr_out[["S.D."]] / 2
+        lower <- cstat - 1.96 * se
+        upper <- cstat + 1.96 * se
+        
+        cstat_rcorr_list[["overall"]] <- tibble(
+          subgroup = "overall",
+          level = NA,
+          Cstatistics = cstat,
+          se = se,
+          CstatisticsLL = lower,
+          CstatisticsUL = upper,
+          observations = stats$n,
+          CV_events = stats$CV_events,
+          personyears = round(stats$personyears, 1),
+          cstat_fmt = sprintf("%.3f [%.3f–%.3f]", cstat, lower, upper)
+        )
+        
+        score_out <- riskRegression::Score(
+          list("model" = df[[risk_col]]),
+          formula = Hist(trunc_fu, comp.event_trunc) ~ 1,
+          data = df,
+          times = tmax,
+          metrics = "auc",
+          cause = 1
+        )
+        
+        score_val <- score_out$AUC$score %>%
+          filter(model == "model") %>%
+          select(AUC, lower, upper) %>%
+          slice(1)
+        
+        cstat_score_list[["overall"]] <- tibble(
+          subgroup = "overall",
+          level = NA,
+          Cstatistics = score_val$AUC,
+          lower = score_val$lower,
+          upper = score_val$upper,
+          observations = stats$n,
+          CV_events = stats$CV_events,
+          personyears = round(stats$personyears, 1),
+          cstat_fmt = sprintf("%.3f [%.3f–%.3f]", score_val$AUC, score_val$lower, score_val$upper)
+        )
+        
+        # Combine and return
+        return(list(
+          cstat_rcorr = bind_rows(cstat_rcorr_list),
+          cstat_score = bind_rows(cstat_score_list)
+        ))
+      }
+      
+      # Run subgroup C-statistic analysis
+      cstat_results <- calculate_cstat_subgroup(data)
+      
+      ######### Decision Curve Analysis ######### 
+      data_dca <- data %>% 
+        mutate(
+          evcom_n_trunc = ifelse(follow.up > maxtime + 0.0001, 0, evcom_n),
+          trunc_fu = pmin(follow.up, maxtime + 0.0001)
+        )
+      
+      thresholds <- seq(0, 0.99, by = 0.01)
+      dca_results <- dca(
+        data = data_dca,
+        formula = evcom_n_trunc ~ calc_risk,
+        thresholds = thresholds
+      )
+      
+      dca_tibbles <- dca_results$dca
+      
+      # Store comprehensive results for current model
+      results_list[[suffix]] <- list(
+        EO_ratio = bind_rows(eo_list),
+        Calibration_pre = calibration_summary_norec,
+        Calibration_post = calibration_summary_rec,
+        Calibration_plot_pre = subgroup_cal_plots_pre,  
+        Calibration_plot_post = subgroup_cal_plots_post, 
+        Cstatistic_rcorr = cstat_results$cstat_rcorr,
+        Cstatistic_score = cstat_results$cstat_score,
+        DCA = dca_tibbles
+      )
+    }
+```
+
