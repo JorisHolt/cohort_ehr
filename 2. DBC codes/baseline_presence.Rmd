@@ -1,0 +1,52 @@
+---
+title: "Definitions of endpoints using insurance codes"
+author: "Joris Holtrop"
+date: "`r format(Sys.Date(), '%Y-%B-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: readable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(readxl)
+library(knitr)
+library(DT)
+```
+
+## Contents
+-   [1. Codes for baseline presence of CV disease](#definitions-of-cardiovascular-disease-at-baseline)
+
+# Definitions of cardiovascular disease at baseline
+```{r}
+
+baseline_codes <- readxl::read_xlsx("H:/ZZ - Secure-E-Health/Manusscript CBS/GitHub/Baseline Disease codes.xlsx")
+
+baseline_codes %>% 
+      dplyr::select(DiagnoseID, Specialisme_Diagnose, Translated) %>% 
+      mutate(specialty = case_when(
+        
+        Specialisme_Diagnose == "CAR" ~ "Cardiology", 
+        Specialisme_Diagnose == "CHI" ~ "Surgery", 
+        Specialisme_Diagnose == "CTC" ~ "Cardio-thoracic surgery", 
+        Specialisme_Diagnose == "GER" ~ "Geriatrics", 
+        Specialisme_Diagnose == "INT" ~ "Internal medicine", 
+        Specialisme_Diagnose == "NEU" ~ "Neurology", 
+        Specialisme_Diagnose == "REV" ~ "Rehabilitation  medicine", 
+        TRUE ~ NA_character_
+      )) %>% 
+      distinct() %>% 
+      rename(code = DiagnoseID, specialty = specialty, description = Translated) %>% 
+      arrange(specialty, code) %>% 
+      dplyr::select(code, specialty, description) %>% 
+    kable(caption = "Codes for baseline presence of cardiovascular disease",
+          col.names = c("Insurance Code", "Specialty", "Description"))
+
+```
+
+
+---
